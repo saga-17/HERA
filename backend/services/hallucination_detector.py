@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Optional
 
 import numpy as np
@@ -26,6 +27,11 @@ class HallucinationDetector:
     """
     Verify each reasoning step against retrieved evidence.
     Adapted from CaVe-VLM-CoT verifier and citation_injector logic.
+
+    A claim is accepted if it is supported by VISUAL evidence OR TEXTUAL
+    evidence (not textual evidence alone) — the best single score across both
+    evidence pools decides support, and an average of the top matches is used
+    so one weak caption can't zero out an otherwise well-supported claim.
     """
 
     def verify_step(
@@ -35,38 +41,50 @@ class HallucinationDetector:
         visual_evidence: list[VisualEvidence],
         textual_evidence: list[TextEvidence],
     ) -> ReasoningStepResult:
+        start = time.time()
+        logger.info(
+            "START StepVerification step=%d | visual_evidence=%d | textual_evidence=%d",
+            step_index, len(visual_evidence), len(textual_evidence),
+        )
+
         extraction = extract_entities(step_text)
 
         if settings.demo_mode:
-            return self._demo_verify(step_index, step_text, visual_evidence, textual_evidence, extraction)
-
-        confidence, supported, issue = self._score_step(step_text, visual_evidence, textual_evidence)
-
-        if confidence >= settings.supported_threshold:
-            status = StepStatus.SUPPORTED
-            hallucination_type = HallucinationType.NONE
-        elif confidence <= settings.hallucinated_threshold:
-            status = StepStatus.HALLUCINATED
-            hallucination_type = HallucinationType(classify_hallucination_type(step_text, issue))
+            result = self._demo_verify(step_index, step_text, visual_evidence, textual_evidence, extraction)
         else:
-            status = StepStatus.UNCERTAIN
-            hallucination_type = HallucinationType.REASONING
+            confidence, supported, issue = self._score_step(step_text, visual_evidence, textual_evidence)
 
-        evidence_summary = self._build_evidence_summary(visual_evidence, textual_evidence)
+            if confidence >= settings.supported_threshold:
+                status = StepStatus.SUPPORTED
+                hallucination_type = HallucinationType.NONE
+            elif confidence <= settings.hallucinated_threshold:
+                status = StepStatus.HALLUCINATED
+                hallucination_type = HallucinationType(classify_hallucination_type(step_text, issue))
+            else:
+                status = StepStatus.UNCERTAIN
+                hallucination_type = HallucinationType.REASONING
 
-        return ReasoningStepResult(
-            step_index=step_index,
-            step=step_text,
-            status=status,
-            confidence=round(confidence, 3),
-            supported=supported,
-            hallucination_type=hallucination_type,
-            evidence=evidence_summary,
-            visual_evidence=visual_evidence,
-            textual_evidence=textual_evidence,
-            attribution=self._build_attribution(status, visual_evidence, textual_evidence, issue),
-            extraction=extraction,
+            evidence_summary = self._build_evidence_summary(visual_evidence, textual_evidence)
+
+            result = ReasoningStepResult(
+                step_index=step_index,
+                step=step_text,
+                status=status,
+                confidence=round(confidence, 3),
+                supported=supported,
+                hallucination_type=hallucination_type,
+                evidence=evidence_summary,
+                visual_evidence=visual_evidence,
+                textual_evidence=textual_evidence,
+                attribution=self._build_attribution(status, visual_evidence, textual_evidence, issue),
+                extraction=extraction,
+            )
+
+        logger.info(
+            "END StepVerification step=%d | %.3fs | status=%s | confidence=%.3f | type=%s",
+            step_index, time.time() - start, result.status, result.confidence, result.hallucination_type,
         )
+        return result
 
     def _score_step(
         self,
@@ -74,42 +92,63 @@ class HallucinationDetector:
         visual_evidence: list[VisualEvidence],
         textual_evidence: list[TextEvidence],
     ) -> tuple[float, bool, str]:
-        """Cross-encoder scoring of step against all evidence."""
+        """
+        Cross-encoder scoring of step against all evidence (visual captions AND
+        textual snippets are pooled together — the claim only needs support from
+        ONE of the two evidence types, not both).
+        """
         encoder = model_manager.get_cross_encoder()
-        scores: list[float] = []
-        issue = ""
+        visual_scores: list[float] = []
+        textual_scores: list[float] = []
 
         for ve in visual_evidence:
             try:
                 score = float(encoder.predict([(step_text, ve.caption)])[0])
-                scores.append(score)
+                visual_scores.append(score)
             except Exception:
-                scores.append(ve.confidence)
+                # Fall back to the retriever's own confidence, mapped back to
+                # the encoder's raw scale so it composes correctly below.
+                visual_scores.append((ve.confidence * 20) - 10)
 
         for te in textual_evidence:
             try:
                 score = float(encoder.predict([(step_text, te.text[:300])])[0])
-                scores.append(score)
+                textual_scores.append(score)
             except Exception:
-                scores.append(te.confidence)
+                textual_scores.append((te.confidence * 20) - 10)
 
-        if not scores:
+        all_scores = visual_scores + textual_scores
+        if not all_scores:
             return 0.4, False, "no evidence retrieved"
 
-        # Normalize cross-encoder scores (roughly -10 to +10) to 0-1
-        raw_max = max(scores)
-        confidence = self._normalize_score(raw_max)
+        # Use the average of the top-2 scores (across BOTH evidence pools)
+        # rather than a single max. This is more robust than one lucky/unlucky
+        # match while still letting either evidence type carry the claim.
+        top = sorted(all_scores, reverse=True)[:2]
+        raw_score = sum(top) / len(top)
+        confidence = self._normalize_score(raw_score)
         supported = confidence >= settings.supported_threshold
 
+        issue = ""
         if not supported:
             issue = "claim not supported by retrieved visual or textual evidence"
 
         return confidence, supported, issue
 
     def _normalize_score(self, raw: float) -> float:
-        """Map cross-encoder score to 0-1 confidence."""
-        # Sigmoid-like normalization for ms-marco scores
-        return float(1.0 / (1.0 + np.exp(-raw)))
+        """
+        Map cross-encoder relevance score to a 0-1 confidence.
+
+        ms-marco cross-encoders are trained for query/passage RANKING and
+        typically output raw logits roughly in [-11, 11], where scores well
+        above 0 indicate strong relevance and scores near/below 0 indicate
+        weak or no relevance. A bare sigmoid centered at 0 was previously used,
+        which is directionally correct but was starving out real matches
+        because evidence text was meaningless (see evidence_retriever fix).
+        With meaningful evidence text this normalization now produces a
+        sensible spread; we also clip to avoid float edge cases.
+        """
+        return float(np.clip(1.0 / (1.0 + np.exp(-raw)), 0.0, 1.0))
 
     def _demo_verify(
         self,
@@ -122,7 +161,6 @@ class HallucinationDetector:
         """Deterministic demo verification for development without GPU."""
         text_lower = step_text.lower()
 
-        # Simulate hallucination on specific keywords for demo
         hallucination_keywords = ["glasses", "hat", "flying", "swimming", "red car", "two dogs"]
         is_hallucinated = any(kw in text_lower for kw in hallucination_keywords)
 

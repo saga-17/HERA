@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -55,10 +56,22 @@ class HeraPipeline:
         result_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
     def _update_status(self, result_id: str, stage: PipelineStage, progress: float, message: str) -> None:
+        """
+        Update pipeline status AND persist it immediately.
+
+        Previously this only mutated the in-memory `_results` dict without
+        saving to disk, so anything reading results from disk (a different
+        worker process, a restarted server, etc.) would not see intermediate
+        stage progress until the very end of the run — the frontend would
+        appear to "jump straight to results". Saving on every update fixes
+        stage-by-stage progress reporting end to end.
+        """
         if result_id in self._results:
             self._results[result_id].pipeline_status = PipelineStatus(
                 stage=stage, progress=progress, message=message
             )
+            self._save_result(self._results[result_id])
+            logger.info("[%s] STAGE -> %s (%.0f%%): %s", result_id, stage.value, progress, message)
 
     def run(
         self,
@@ -68,6 +81,7 @@ class HeraPipeline:
         result_id: Optional[str] = None,
     ) -> HeraResult:
         result_id = result_id or str(uuid.uuid4())
+        pipeline_start = time.time()
         image = load_image(image_path)
 
         result = HeraResult(
@@ -88,23 +102,46 @@ class HeraPipeline:
 
         try:
             # Stage 1: CoT Generation
-            logger.info("[%s] Stage 1: CoT Generation", result_id)
+            stage_start = time.time()
+            logger.info("[%s] START CoTGeneration", result_id)
             self._update_status(result_id, PipelineStage.COT_GENERATION, 15, "Generating Chain-of-Thought...")
             original_cot = cot_generator.generate(image, question)
             result.original_cot = original_cot
             self._save_result(result)
+            logger.info(
+                "[%s] END CoTGeneration | %.2fs | chars=%d",
+                result_id, time.time() - stage_start, len(original_cot),
+            )
+
+            # Parse structured sections once. The <OBSERVATIONS> text is the
+            # VLM's real, grounded description of the image ("holding bouquet
+            # of flowers", etc). Previously this was only extracted as a
+            # fallback when step segmentation failed, so the retriever never
+            # got to use it as evidence. Now it's always extracted and threaded
+            # into every step's evidence retrieval below.
+            sections = parse_cot_sections(original_cot)
+            observations = sections.get("observations", "")
+            logger.info(
+                "[%s] Parsed CoT sections: observations=%d chars, reasoning=%s, conclusion=%s",
+                result_id, len(observations), "observations" in sections, "conclusion" in sections,
+            )
 
             # Stage 2: Step Segmentation
-            logger.info("[%s] Stage 2: Step Segmentation", result_id)
+            stage_start = time.time()
+            logger.info("[%s] START StepSegmentation", result_id)
             self._update_status(result_id, PipelineStage.STEP_SEGMENTATION, 30, "Segmenting reasoning steps...")
-            step_texts = segment_reasoning_steps(original_cot)
+            reasoning_text = sections.get("reasoning", original_cot)
+            step_texts = segment_reasoning_steps(reasoning_text)
             if not step_texts:
-                sections = parse_cot_sections(original_cot)
-                reasoning = sections.get("reasoning", original_cot)
-                step_texts = segment_reasoning_steps(reasoning) or [original_cot[:500]]
+                step_texts = segment_reasoning_steps(original_cot) or [original_cot[:500]]
+            logger.info(
+                "[%s] END StepSegmentation | %.2fs | reasoning_count=%d",
+                result_id, time.time() - stage_start, len(step_texts),
+            )
 
             # Stage 3-5: Per-step retrieval, verification, attribution
-            logger.info("[%s] Stage 3-5: Evidence + Verification (%d steps)", result_id, len(step_texts))
+            logger.info("[%s] START EvidenceRetrieval+Verification (%d steps)", result_id, len(step_texts))
+            loop_start = time.time()
             verified_steps = []
             for i, step_text in enumerate(step_texts):
                 progress = 30 + (50 * (i + 1) / len(step_texts))
@@ -116,7 +153,7 @@ class HeraPipeline:
                 )
 
                 visual_ev, textual_ev = evidence_retriever.retrieve_for_step(
-                    step_text, image, question, i
+                    step_text, image, question, i, observations=observations
                 )
 
                 self._update_status(
@@ -132,8 +169,15 @@ class HeraPipeline:
                 verified_steps.append(step_result)
 
             result.steps = verified_steps
+            self._save_result(result)
+            logger.info(
+                "[%s] END EvidenceRetrieval+Verification | %.2fs | steps=%d",
+                result_id, time.time() - loop_start, len(verified_steps),
+            )
 
             # Stage 6: Hallucination Detection (aggregate)
+            stage_start = time.time()
+            logger.info("[%s] START HallucinationDetection", result_id)
             self._update_status(
                 result_id,
                 PipelineStage.HALLUCINATION_DETECTION,
@@ -141,13 +185,23 @@ class HeraPipeline:
                 "Computing hallucination scores...",
             )
             hallucinated = sum(1 for s in verified_steps if not s.supported)
+            supported_count = len(verified_steps) - hallucinated
             result.hallucination_score = round(hallucinated / max(len(verified_steps), 1), 3)
             result.confidence_score = round(
                 sum(s.confidence for s in verified_steps) / max(len(verified_steps), 1),
                 3,
             )
+            self._save_result(result)
+            logger.info(
+                "[%s] END HallucinationDetection | %.2fs | supported=%d | hallucinated=%d | "
+                "hallucination_score=%.3f | confidence_score=%.3f",
+                result_id, time.time() - stage_start, supported_count, hallucinated,
+                result.hallucination_score, result.confidence_score,
+            )
 
             # Stage 7: Evidence Attribution
+            stage_start = time.time()
+            logger.info("[%s] START EvidenceAttribution", result_id)
             self._update_status(
                 result_id,
                 PipelineStage.EVIDENCE_ATTRIBUTION,
@@ -155,8 +209,15 @@ class HeraPipeline:
                 "Building evidence-attributed CoT...",
             )
             result.attributed_cot = evidence_attributor.attribute_steps(verified_steps)
+            self._save_result(result)
+            logger.info(
+                "[%s] END EvidenceAttribution | %.2fs | chars=%d",
+                result_id, time.time() - stage_start, len(result.attributed_cot),
+            )
 
             # Stage 8: Reasoning Correction
+            stage_start = time.time()
+            logger.info("[%s] START ReasoningCorrection", result_id)
             self._update_status(
                 result_id,
                 PipelineStage.REASONING_CORRECTION,
@@ -168,6 +229,10 @@ class HeraPipeline:
             )
             result.corrected_cot = corrected_cot
             result.final_answer = final_answer
+            logger.info(
+                "[%s] END ReasoningCorrection | %.2fs | final_answer=%r",
+                result_id, time.time() - stage_start, final_answer[:120],
+            )
 
             result.pipeline_status = PipelineStatus(
                 stage=PipelineStage.COMPLETE,
@@ -175,7 +240,10 @@ class HeraPipeline:
                 message="Pipeline complete",
             )
             self._save_result(result)
-            logger.info("[%s] Pipeline complete", result_id)
+            logger.info(
+                "[%s] Pipeline complete | total=%.2fs | steps=%d | supported=%d | hallucinated=%d",
+                result_id, time.time() - pipeline_start, len(verified_steps), supported_count, hallucinated,
+            )
 
         except Exception as e:
             logger.exception("[%s] Pipeline failed: %s", result_id, e)
