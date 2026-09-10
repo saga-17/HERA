@@ -223,25 +223,78 @@ export default function PipelineStatusPanel({
       {stages.length > 0 && (
         <ul className="space-y-3">
           {stages.map((stage, index) => {
-            const isCurrent =
-              stage.key === currentStage;
-
             const stageTiming =
               status?.stage_timings?.find(
                 (timing) => timing.stage === stage.key
               );
 
-            const stageCompleted =
+            const hasDuration =
               stageTiming?.duration_seconds !== null &&
-              stageTiming?.duration_seconds !== undefined;
+              stageTiming?.duration_seconds !== undefined &&
+              Number.isFinite(stageTiming.duration_seconds);
 
-            const isStageComplete =
+            const isCurrent =
+              stage.key === currentStage;
+
+            const isCompleted =
               isComplete ||
-              stageCompleted ||
+              hasDuration ||
               index < currentIndex;
 
-            const isStageError =
-              isError && isCurrent;
+            const isRunning =
+              !isComplete &&
+              !isError &&
+              !isCancelled &&
+              isCurrent &&
+              !hasDuration;
+
+            const isPending =
+              !isCompleted &&
+              !isRunning &&
+              !isError &&
+              !isCancelled;
+
+            const isFailure =
+              isError &&
+              isCurrent;
+
+            const isCancelledStage =
+              isCancelled &&
+              isCurrent;
+
+            const iconClass = isFailure
+              ? "bg-red-500/20 text-red-400 border border-red-500"
+              : isCompleted
+              ? "bg-green-500/20 text-green-400 border border-green-500"
+              : isRunning
+              ? "bg-hera-primary/20 text-indigo-300 border border-hera-primary animate-pulse"
+              : isCancelledStage
+              ? "bg-amber-500/20 text-amber-300 border border-amber-500"
+              : isPending
+              ? "bg-slate-700 text-slate-500 border border-slate-600"
+              : "bg-slate-700 text-slate-500 border border-slate-600";
+
+            const textClass = isFailure
+              ? "text-red-300"
+              : isCompleted
+              ? "text-slate-300"
+              : isRunning
+              ? "text-white font-medium"
+              : isCancelledStage
+              ? "text-amber-300"
+              : isPending
+              ? "text-slate-500"
+              : "text-slate-500";
+
+            const iconLabel = isFailure
+              ? "✗"
+              : isCompleted
+              ? "✓"
+              : isCancelledStage
+              ? "−"
+              : isRunning
+              ? "◉"
+              : "○";
 
             return (
               <li
@@ -249,42 +302,19 @@ export default function PipelineStatusPanel({
                 className="flex items-center gap-3"
               >
                 <div
-                  className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
-                    isStageError
-                      ? "bg-red-500/20 text-red-400 border border-red-500"
-                      : isStageComplete
-                      ? "bg-green-500/20 text-green-400 border border-green-500"
-                      : isCurrent
-                      ? "bg-hera-primary/20 text-indigo-300 border border-hera-primary animate-pulse"
-                      : "bg-slate-700 text-slate-500 border border-slate-600"
-                  }`}
+                  className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${iconClass}`}
                 >
-                  {isStageError
-                    ? "✗"
-                    : isStageComplete
-                    ? "✓"
-                    : index + 1}
+                  {iconLabel}
                 </div>
 
                 <div className="flex-1 min-w-0">
-                  <div
-                    className={`text-sm ${
-                      isCurrent
-                        ? "text-white font-medium"
-                        : isStageComplete
-                        ? "text-slate-300"
-                        : "text-slate-500"
-                    }`}
-                  >
+                  <div className={`text-sm ${textClass}`}>
                     {stage.label}
                   </div>
 
-                  {/* Show actual completed stage duration */}
-                  {stageCompleted && (
+                  {hasDuration && (
                     <div className="text-xs text-slate-500 mt-0.5">
-                      {formatDuration(
-                        stageTiming?.duration_seconds
-                      )}
+                      {formatDuration(stageTiming?.duration_seconds)}
                     </div>
                   )}
                 </div>
