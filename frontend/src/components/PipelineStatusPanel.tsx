@@ -75,6 +75,7 @@ export default function PipelineStatusPanel({
 
   const isComplete = currentStage === "complete";
   const isError = currentStage === "error";
+  const isCancelled = currentStage === "cancelled";
 
   const elapsedSeconds =
     status?.elapsed_seconds ?? 0;
@@ -106,6 +107,8 @@ export default function PipelineStatusPanel({
                 ? "HERA Pipeline Complete"
                 : isError
                 ? "HERA Pipeline Error"
+                : isCancelled
+                ? "HERA Pipeline Cancelled"
                 : "HERA Pipeline Running"}
             </span>
 
@@ -120,6 +123,8 @@ export default function PipelineStatusPanel({
               className={`h-3 rounded-full transition-all duration-500 ${
                 isError
                   ? "bg-red-500"
+                  : isCancelled
+                  ? "bg-amber-500"
                   : isComplete
                   ? "bg-green-500"
                   : "bg-gradient-to-r from-hera-primary to-hera-secondary"
@@ -151,7 +156,7 @@ export default function PipelineStatusPanel({
                   )}
             </div>
 
-            {!isComplete && !isError && (
+            {!isComplete && !isError && !isCancelled && (
               <div className="text-xs text-slate-500 mt-1">
                 Stage {currentIndex + 1} of {totalStages}
               </div>
@@ -199,6 +204,13 @@ export default function PipelineStatusPanel({
             <div className="mt-4 rounded-lg bg-green-500/10 border border-green-500/30 px-3 py-2">
               <span className="text-sm text-green-400 font-medium">
                 Completed in {formatDuration(elapsedSeconds)}
+              </span>
+            </div>
+          )}
+          {isCancelled && (
+            <div className="mt-4 rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2">
+              <span className="text-sm text-amber-300 font-medium">
+                Pipeline cancelled.
               </span>
             </div>
           )}

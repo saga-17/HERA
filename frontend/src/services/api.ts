@@ -42,6 +42,13 @@ export async function askQuestion(
   return handleResponse<AskResponse>(res);
 }
 
+export async function cancelInference(resultId: string): Promise<{ result_id: string; status: string }> {
+  const res = await fetch(`${API_BASE}/cancel/${resultId}`, {
+    method: "POST",
+  });
+  return handleResponse<{ result_id: string; status: string }>(res);
+}
+
 export async function getResult(resultId: string): Promise<HeraResult> {
   const res = await fetch(`${API_BASE}/result/${resultId}`);
   return handleResponse<HeraResult>(res);

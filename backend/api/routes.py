@@ -68,21 +68,43 @@ async def ask_question(request: AskRequest, background_tasks: BackgroundTasks) -
     if not matches:
         raise HTTPException(status_code=404, detail="Image not found. Upload an image first.")
 
-    if not request.question.strip():
+    question = request.question.strip()
+    if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    active_result_id = hera_pipeline.get_active_result_for_request(
+        request.image_id,
+        question,
+    )
+    if active_result_id is not None:
+        return AskResponse(result_id=active_result_id, status="running")
 
     result_id = str(uuid.uuid4())
     image_path = str(matches[0])
+
+    hera_pipeline.register_result_for_request(
+        request.image_id,
+        question,
+        result_id,
+    )
 
     background_tasks.add_task(
         hera_pipeline.run,
         image_path,
         request.image_id,
-        request.question.strip(),
+        question,
         result_id,
     )
 
     return AskResponse(result_id=result_id, status="processing")
+
+
+@router.post("/cancel/{result_id}")
+async def cancel_inference(result_id: str) -> dict[str, str]:
+    cancelled = hera_pipeline.cancel(result_id)
+    if cancelled is None:
+        raise HTTPException(status_code=404, detail="Inference not found")
+    return {"result_id": result_id, "status": "cancelled"}
 
 
 @router.post("/ask-sync", response_model=HeraResult)

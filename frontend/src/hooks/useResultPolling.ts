@@ -19,7 +19,11 @@ export function useResultPolling(resultId: string | null, intervalMs = 2000): Us
     try {
       const data = await getResult(resultId);
       setResult(data);
-      if (data.pipeline_status.stage === "complete" || data.pipeline_status.stage === "error") {
+      if (
+        data.pipeline_status.stage === "complete" ||
+        data.pipeline_status.stage === "error" ||
+        data.pipeline_status.stage === "cancelled"
+      ) {
         setLoading(false);
         if (intervalRef.current) {
           clearInterval(intervalRef.current);
@@ -33,7 +37,16 @@ export function useResultPolling(resultId: string | null, intervalMs = 2000): Us
   }, [resultId]);
 
   useEffect(() => {
-    if (!resultId) return;
+    if (!resultId) {
+      setResult(null);
+      setLoading(false);
+      setError(null);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
 
     setLoading(true);
     setError(null);

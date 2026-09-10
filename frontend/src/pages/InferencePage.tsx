@@ -1,8 +1,10 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import PipelineStatusPanel from "../components/PipelineStatusPanel";
-import { askQuestion, uploadImage } from "../services/api";
+import { askQuestion, cancelInference, uploadImage } from "../services/api";
 import { useResultPolling } from "../hooks/useResultPolling";
+
+type PipelineStatusValue = "idle" | "running" | "completed" | "failed" | "cancelled";
 
 export default function InferencePage() {
   const [imageId, setImageId] = useState<string | null>(null);
@@ -12,10 +14,33 @@ export default function InferencePage() {
   const [submitting, setSubmitting] = useState(false);
   const [resultId, setResultId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pipelineStatus, setPipelineStatus] = useState<PipelineStatusValue>("idle");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
 
   const { result, loading } = useResultPolling(resultId);
+
+  useEffect(() => {
+    if (!result) {
+      return;
+    }
+
+    const stage = result.pipeline_status.stage?.toLowerCase?.() ?? "";
+    if (stage === "complete") {
+      setPipelineStatus("completed");
+      return;
+    }
+    if (stage === "error") {
+      setPipelineStatus("failed");
+      return;
+    }
+    if (stage === "cancelled") {
+      setPipelineStatus("cancelled");
+      return;
+    }
+    setPipelineStatus("running");
+  }, [result]);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -35,27 +60,88 @@ export default function InferencePage() {
     }
   };
 
+  const isRunning = pipelineStatus === "running" || submitting || loading;
+
   const handleSubmit = async () => {
-    if (!imageId || !question.trim()) return;
+    if (!imageId || !question.trim() || isRunning) return;
 
     setSubmitting(true);
     setError(null);
+    setPipelineStatus("running");
+    setResultId(null);
 
     try {
       const response = await askQuestion(imageId, question);
       setResultId(response.result_id);
+      setPipelineStatus(response.status === "running" ? "running" : "running");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Inference failed");
+      setPipelineStatus("failed");
     } finally {
       setSubmitting(false);
     }
   };
 
+  const handleEditRestart = async () => {
+    if (!resultId) {
+      setPipelineStatus("idle");
+      promptRef.current?.focus();
+      return;
+    }
+
+    const confirmRestart = window.confirm(
+      "The current pipeline will be stopped and restarted with the new prompt."
+    );
+
+    if (!confirmRestart) {
+      return;
+    }
+
+    try {
+      await cancelInference(resultId);
+    } catch (err) {
+      console.warn("Pipeline cancel skipped", err);
+    }
+
+    setResultId(null);
+    setPipelineStatus("idle");
+    setError(null);
+    setSubmitting(false);
+    promptRef.current?.focus();
+  };
+
+  const handleTerminateProcess = async () => {
+    if (!resultId) {
+      return;
+    }
+
+    const confirmTerminate = window.confirm(
+      "Terminate the current HERA pipeline?\nThe current processing will be stopped."
+    );
+
+    if (!confirmTerminate) {
+      return;
+    }
+
+    try {
+      await cancelInference(resultId);
+    } catch (err) {
+      console.warn("Terminate failed", err);
+    }
+
+    setResultId(null);
+    setPipelineStatus("cancelled");
+    setSubmitting(false);
+    setError(null);
+  };
+
   const isComplete = result?.pipeline_status.stage === "complete";
 
-  if (isComplete && resultId) {
-    navigate(`/result/${resultId}`);
-  }
+  useEffect(() => {
+    if (isComplete && resultId) {
+      navigate(`/result/${resultId}`);
+    }
+  }, [isComplete, resultId, navigate]);
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
@@ -99,26 +185,59 @@ export default function InferencePage() {
         {/* Middle: Question Input */}
         <div className="card flex flex-col">
           <h3 className="text-lg font-semibold mb-4">Question</h3>
+
+          {isRunning && (
+            <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+              Pipeline running...
+            </div>
+          )}
+
           <textarea
+            ref={promptRef}
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             placeholder="What do you see in this image? Ask a detailed question..."
-            className="flex-1 bg-slate-800/50 border border-slate-600 rounded-xl p-4 text-white placeholder-slate-500 resize-none focus:outline-none focus:border-hera-primary min-h-[200px]"
+            disabled={isRunning}
+            className="flex-1 bg-slate-800/50 border border-slate-600 rounded-xl p-4 text-white placeholder-slate-500 resize-none focus:outline-none focus:border-hera-primary min-h-[200px] disabled:opacity-75 disabled:cursor-not-allowed"
           />
-          <button
-            onClick={handleSubmit}
-            disabled={!imageId || !question.trim() || submitting || loading}
-            className="btn-primary w-full mt-4"
-          >
-            {submitting || loading ? "Processing..." : "Run HERA Pipeline"}
-          </button>
+
+          {isRunning && (
+            <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+              <button
+                type="button"
+                onClick={handleEditRestart}
+                className="btn-secondary flex-1"
+              >
+                Edit Prompt & Restart
+              </button>
+              <button
+                type="button"
+                onClick={handleTerminateProcess}
+                className="bg-red-600 hover:bg-red-500 text-white font-medium px-4 py-2 rounded-lg transition-colors"
+              >
+                Terminate Process
+              </button>
+            </div>
+          )}
+
+          {!isRunning && (
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={!imageId || !question.trim() || isRunning}
+              className="btn-primary w-full mt-4"
+            >
+              Run HERA Pipeline
+            </button>
+          )}
+
           {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
         </div>
 
         {/* Right: Pipeline Status */}
         <PipelineStatusPanel
           status={result?.pipeline_status || null}
-          loading={loading || submitting}
+          loading={isRunning}
         />
       </div>
     </div>

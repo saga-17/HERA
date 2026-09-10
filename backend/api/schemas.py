@@ -33,6 +33,7 @@ class PipelineStage(str, Enum):
     REASONING_CORRECTION = "reasoning_correction"
     COMPLETE = "complete"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 class VisualEvidence(BaseModel):
