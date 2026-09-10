@@ -5,7 +5,7 @@ export default function HomePage() {
     <div className="max-w-7xl mx-auto px-4 py-16">
       <div className="text-center mb-16">
         <div className="inline-flex items-center gap-2 bg-hera-primary/10 border border-hera-primary/30 rounded-full px-4 py-1.5 text-sm text-indigo-300 mb-6">
-          Team 7 — HERA-VLM Research Project
+          HERA-VLM
         </div>
         <h1 className="text-5xl font-bold mb-6 bg-gradient-to-r from-white via-indigo-200 to-purple-300 bg-clip-text text-transparent">
           Hallucination Evidence Retrieval
