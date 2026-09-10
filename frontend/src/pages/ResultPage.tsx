@@ -4,6 +4,69 @@ import ReasoningStepCard from "../components/ReasoningStepCard";
 import { getImageUrl, getResult } from "../services/api";
 import type { HeraResult } from "../services/types";
 
+const STRUCTURED_SECTION_LABELS: Record<string, string> = {
+  observations: "Observations",
+  reasoning: "Reasoning",
+  conclusion: "Conclusion",
+  answer: "Answer",
+  corrected_reasoning: "Corrected Reasoning",
+  final_reasoning: "Corrected Reasoning",
+};
+
+function stripKnownStructuralTags(text: string): string {
+  return text.replace(
+    /<\s*(?:\/\s*)?(?:observations|reasoning|conclusion|answer|corrected_reasoning|final_reasoning|corrected\s*[_ ]?reasoning|final\s*[_ ]?reasoning)\s*>/gi,
+    ""
+  ).trim();
+}
+
+function parseStructuredSections(rawText: string): { title: string; body: string }[] {
+  const sections: { title: string; body: string }[] = [];
+  const tagPattern = /<\s*([A-Za-z][A-Za-z0-9_ ]*?)\s*>([\s\S]*?)(?:<\/\s*\1\s*>|$)/gi;
+  const matches = Array.from(rawText.matchAll(tagPattern));
+
+  for (const match of matches) {
+    const [, rawTag, content] = match;
+    const normalizedTag = rawTag.replace(/[\s_]+/g, " ").trim().toLowerCase();
+    const title = STRUCTURED_SECTION_LABELS[normalizedTag] ?? rawTag.trim();
+    const body = content.trim();
+
+    if (body && title && normalizedTag in STRUCTURED_SECTION_LABELS) {
+      sections.push({ title, body });
+    }
+  }
+
+  if (sections.length === 0) {
+    const fallback = stripKnownStructuralTags(rawText);
+    if (fallback) {
+      sections.push({ title: "Reasoning", body: fallback });
+    }
+  }
+
+  return sections;
+}
+
+function renderStructuredText(rawText: string) {
+  const sections = parseStructuredSections(rawText);
+
+  if (sections.length === 0) {
+    return <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed max-h-64 overflow-y-auto">{rawText || "No reasoning available."}</pre>;
+  }
+
+  return (
+    <div className="space-y-4 max-h-64 overflow-y-auto pr-1">
+      {sections.map((section) => (
+        <div key={`${section.title}-${section.body.slice(0, 16)}`} className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+          <h4 className="text-xs uppercase tracking-wide text-slate-400 mb-2">{section.title}</h4>
+          <div className="text-sm text-slate-200 whitespace-pre-wrap leading-relaxed">
+            {section.body}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function ResultPage() {
   const { resultId } = useParams<{ resultId: string }>();
   const [result, setResult] = useState<HeraResult | null>(null);
@@ -94,24 +157,18 @@ export default function ResultPage() {
       <div className="grid lg:grid-cols-2 gap-6 mb-8">
         <div className="card">
           <h3 className="font-semibold mb-3">Original Chain-of-Thought</h3>
-          <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed max-h-64 overflow-y-auto">
-            {result.original_cot}
-          </pre>
+          {renderStructuredText(result.original_cot)}
         </div>
         <div className="card">
           <h3 className="font-semibold mb-3">Evidence-Attributed CoT</h3>
-          <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed max-h-64 overflow-y-auto">
-            {result.attributed_cot}
-          </pre>
+          {renderStructuredText(result.attributed_cot)}
         </div>
       </div>
 
       {result.corrected_cot && (
         <div className="card mb-8">
           <h3 className="font-semibold mb-3">Corrected Reasoning</h3>
-          <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed">
-            {result.corrected_cot}
-          </pre>
+          {renderStructuredText(result.corrected_cot)}
         </div>
       )}
 

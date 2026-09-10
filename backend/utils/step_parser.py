@@ -9,12 +9,15 @@ from backend.api.schemas import EntityExtraction
 
 
 _TAG_PATTERN = re.compile(
-    r"</?(?:SUMMARY|CAPTION|REASONING|CONCLUSION|OBSERVATIONS|ANSWER|answer|reasoning|conclusion)>"
+    r"</?(?:SUMMARY|CAPTION|REASONING|CONCLUSION|OBSERVATIONS|ANSWER|CORRECTED_REASONING|FINAL_REASONING|"
+    r"answer|reasoning|conclusion|observations|corrected_reasoning|final_reasoning|"
+    r"corrected\s*[_ ]?reasoning|final\s*[_ ]?reasoning)\s*>",
+    re.IGNORECASE,
 )
 
 
 def clean_reasoning_text(text: str) -> str:
-    """Remove XML-like tags from CoT output."""
+    """Remove known XML-like tags from CoT output while preserving content."""
     text = _TAG_PATTERN.sub("", text)
     text = re.sub(r"\[Text Evidence \d+\]|\[Question Image \d+\]|\[Image ROI \d+\]", "", text)
     return text.strip()
@@ -114,11 +117,47 @@ def classify_hallucination_type(step_text: str, issue: str) -> str:
 def parse_cot_sections(cot_text: str) -> dict[str, Any]:
     """Extract structured sections from VLM CoT output."""
     sections: dict[str, Any] = {}
+    tag_patterns = (
+        ("OBSERVATIONS", "observations"),
+        ("REASONING", "reasoning"),
+        ("CONCLUSION", "conclusion"),
+        ("ANSWER", "answer"),
+        ("CORRECTED_REASONING", "corrected_reasoning"),
+        ("FINAL_REASONING", "final_reasoning"),
+    )
 
-    for tag in ("OBSERVATIONS", "REASONING", "CONCLUSION", "ANSWER"):
-        match = re.search(rf"<{tag}>(.*?)</{tag}>", cot_text, re.IGNORECASE | re.DOTALL)
+    for tag, normalized in tag_patterns:
+        match = re.search(
+            rf"<{tag}>\s*(.*?)\s*</{tag}>",
+            cot_text,
+            re.IGNORECASE | re.DOTALL,
+        )
         if match:
-            sections[tag.lower()] = match.group(1).strip()
+            sections[normalized] = match.group(1).strip()
+
+    if "observations" not in sections:
+        match = re.search(r"<\s*observations\s*>\s*(.*?)\s*</\s*observations\s*>", cot_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            sections["observations"] = match.group(1).strip()
+
+    if "reasoning" not in sections:
+        match = re.search(r"<\s*reasoning\s*>\s*(.*?)\s*</\s*reasoning\s*>", cot_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            sections["reasoning"] = match.group(1).strip()
+
+    if "conclusion" not in sections:
+        match = re.search(r"<\s*conclusion\s*>\s*(.*?)\s*</\s*conclusion\s*>", cot_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            sections["conclusion"] = match.group(1).strip()
+
+    if "corrected_reasoning" not in sections:
+        match = re.search(
+            r"<\s*(?:corrected\s*[_ ]?reasoning|final\s*[_ ]?reasoning)\s*>\s*(.*?)\s*</\s*(?:corrected\s*[_ ]?reasoning|final\s*[_ ]?reasoning)\s*>",
+            cot_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            sections["corrected_reasoning"] = match.group(1).strip()
 
     # Extract final answer line
     answer_match = re.search(
