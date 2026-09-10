@@ -147,9 +147,9 @@ export default function InferencePage() {
     <div className="max-w-7xl mx-auto px-4 py-8">
       <h1 className="text-3xl font-bold mb-8">Inference</h1>
 
-      <div className="grid lg:grid-cols-3 gap-6">
+      <div className="grid gap-6 xl:grid-cols-3 lg:grid-cols-2 md:grid-cols-1">
         {/* Left: Image Upload */}
-        <div className="card">
+        <div className="card min-w-0">
           <h3 className="text-lg font-semibold mb-4">Image Upload</h3>
           <div
             className="border-2 border-dashed border-slate-600 rounded-xl p-4 text-center cursor-pointer hover:border-hera-primary/50 transition-colors min-h-[280px] flex flex-col items-center justify-center"
@@ -159,7 +159,7 @@ export default function InferencePage() {
               <img
                 src={previewUrl}
                 alt="Preview"
-                className="max-h-64 rounded-lg object-contain"
+                className="max-h-64 w-full rounded-lg object-contain"
               />
             ) : (
               <>
@@ -183,7 +183,7 @@ export default function InferencePage() {
         </div>
 
         {/* Middle: Question Input */}
-        <div className="card flex flex-col">
+        <div className="card flex flex-col min-w-0">
           <h3 className="text-lg font-semibold mb-4">Question</h3>
 
           {isRunning && (
@@ -201,8 +201,29 @@ export default function InferencePage() {
             className="flex-1 bg-slate-800/50 border border-slate-600 rounded-xl p-4 text-white placeholder-slate-500 resize-none focus:outline-none focus:border-hera-primary min-h-[200px] disabled:opacity-75 disabled:cursor-not-allowed"
           />
 
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            {isRunning ? (
+              <button
+                type="button"
+                className="btn-primary flex-1 disabled:cursor-not-allowed"
+                disabled
+              >
+                Running...
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSubmit}
+                disabled={!imageId || !question.trim()}
+                className="btn-primary flex-1"
+              >
+                Run HERA Pipeline
+              </button>
+            )}
+          </div>
+
           {isRunning && (
-            <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
               <button
                 type="button"
                 onClick={handleEditRestart}
@@ -218,17 +239,6 @@ export default function InferencePage() {
                 Terminate Process
               </button>
             </div>
-          )}
-
-          {!isRunning && (
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={!imageId || !question.trim() || isRunning}
-              className="btn-primary w-full mt-4"
-            >
-              Run HERA Pipeline
-            </button>
           )}
 
           {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
