@@ -14,7 +14,9 @@ from PIL import Image
 from backend.api.schemas import (
     HeraResult,
     PipelineStage,
+    PipelineStageInfo,
     PipelineStatus,
+    StageTiming,
 )
 from backend.config import settings
 from backend.services.cot_generator import cot_generator
@@ -31,47 +33,506 @@ logger = logging.getLogger(__name__)
 class HeraPipeline:
     """
     Full HERA-VLM pipeline:
-    Image + Question → CoT → Step Segmentation → Evidence Retrieval →
-    Verification → Hallucination Detection → Attribution → Correction → Answer
+
+    Image + Question
+        → CoT Generation
+        → Step Segmentation
+        → Evidence Retrieval
+        → Step Verification
+        → Hallucination Detection
+        → Evidence Attribution
+        → Reasoning Correction
+        → Complete
     """
+
+    # These are the actual executable stages in the current backend.
+    #
+    # The frontend receives this definition from PipelineStatus, so it does
+    # not need to duplicate the pipeline definition.
+    PIPELINE_STAGES: tuple[PipelineStageInfo, ...] = (
+        PipelineStageInfo(
+            key=PipelineStage.COT_GENERATION.value,
+            label="CoT Generation",
+            order=1,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.STEP_SEGMENTATION.value,
+            label="Step Segmentation",
+            order=2,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.EVIDENCE_RETRIEVAL.value,
+            label="Evidence Retrieval",
+            order=3,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.STEP_VERIFICATION.value,
+            label="Step Verification",
+            order=4,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.HALLUCINATION_DETECTION.value,
+            label="Hallucination Detection",
+            order=5,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.EVIDENCE_ATTRIBUTION.value,
+            label="Evidence Attribution",
+            order=6,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.REASONING_CORRECTION.value,
+            label="Reasoning Correction",
+            order=7,
+        ),
+        PipelineStageInfo(
+            key=PipelineStage.COMPLETE.value,
+            label="Complete",
+            order=8,
+        ),
+    )
+
+    # Approximate stage weights in seconds.
+    #
+    # These are NOT displayed as fake progress. They are only used to
+    # estimate ETA when no timing history exists yet.
+    #
+    # Once actual timings are available, observed timings take precedence.
+    DEFAULT_STAGE_ESTIMATES: dict[PipelineStage, float] = {
+        PipelineStage.COT_GENERATION: 20.0,
+        PipelineStage.STEP_SEGMENTATION: 2.0,
+        PipelineStage.EVIDENCE_RETRIEVAL: 30.0,
+        PipelineStage.STEP_VERIFICATION: 15.0,
+        PipelineStage.HALLUCINATION_DETECTION: 3.0,
+        PipelineStage.EVIDENCE_ATTRIBUTION: 5.0,
+        PipelineStage.REASONING_CORRECTION: 15.0,
+    }
 
     def __init__(self) -> None:
         self._results: dict[str, HeraResult] = {}
         self._status_callbacks: dict[str, Callable] = {}
+
+    # ------------------------------------------------------------------
+    # Basic result persistence
+    # ------------------------------------------------------------------
 
     def get_result(self, result_id: str) -> Optional[HeraResult]:
         if result_id in self._results:
             return self._results[result_id]
 
         result_path = settings.results_dir / f"{result_id}.json"
+
         if result_path.exists():
             data = json.loads(result_path.read_text(encoding="utf-8"))
-            return HeraResult(**data)
+            result = HeraResult(**data)
+            self._results[result_id] = result
+            return result
 
         return None
 
     def _save_result(self, result: HeraResult) -> None:
         self._results[result.result_id] = result
+
         result_path = settings.results_dir / f"{result.result_id}.json"
-        result_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        result_path.write_text(
+            result.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
 
-    def _update_status(self, result_id: str, stage: PipelineStage, progress: float, message: str) -> None:
-        """
-        Update pipeline status AND persist it immediately.
+    # ------------------------------------------------------------------
+    # Pipeline metadata
+    # ------------------------------------------------------------------
 
-        Previously this only mutated the in-memory `_results` dict without
-        saving to disk, so anything reading results from disk (a different
-        worker process, a restarted server, etc.) would not see intermediate
-        stage progress until the very end of the run — the frontend would
-        appear to "jump straight to results". Saving on every update fixes
-        stage-by-stage progress reporting end to end.
+    def _stage_index(self, stage: PipelineStage) -> int:
         """
-        if result_id in self._results:
-            self._results[result_id].pipeline_status = PipelineStatus(
-                stage=stage, progress=progress, message=message
+        Return the 1-based stage number for an actual pipeline stage.
+
+        COMPLETE is stage 8 of 8.
+        ERROR is not treated as a normal pipeline stage.
+        """
+        for stage_info in self.PIPELINE_STAGES:
+            if stage_info.key == stage.value:
+                return stage_info.order
+
+        return 0
+
+    def _stage_label(self, stage: PipelineStage) -> str:
+        for stage_info in self.PIPELINE_STAGES:
+            if stage_info.key == stage.value:
+                return stage_info.label
+
+        return stage.value.replace("_", " ").title()
+
+    def _default_status(
+        self,
+        stage: PipelineStage,
+        *,
+        progress: float = 0.0,
+        message: str = "",
+        started_at: Optional[float] = None,
+    ) -> PipelineStatus:
+        return PipelineStatus(
+            stage=stage,
+            progress=progress,
+            message=message,
+            stages=list(self.PIPELINE_STAGES),
+            stage_index=self._stage_index(stage),
+            total_stages=len(self.PIPELINE_STAGES),
+            completed_stages=0,
+            started_at=started_at,
+            elapsed_seconds=0.0,
+            current_stage_elapsed_seconds=0.0,
+            estimated_remaining_seconds=None,
+            eta_confidence="calculating",
+            stage_timings=[],
+        )
+
+    # ------------------------------------------------------------------
+    # Timing helpers
+    # ------------------------------------------------------------------
+
+    def _find_stage_timing(
+        self,
+        status: PipelineStatus,
+        stage: PipelineStage,
+    ) -> Optional[StageTiming]:
+        for timing in status.stage_timings:
+            if timing.stage == stage:
+                return timing
+
+        return None
+
+    def _start_stage_timing(
+        self,
+        status: PipelineStatus,
+        stage: PipelineStage,
+        now: float,
+    ) -> None:
+        existing = self._find_stage_timing(status, stage)
+
+        if existing is not None:
+            existing.started_at = existing.started_at or now
+            existing.completed_at = None
+            existing.duration_seconds = None
+            return
+
+        status.stage_timings.append(
+            StageTiming(
+                stage=stage,
+                label=self._stage_label(stage),
+                started_at=now,
+                completed_at=None,
+                duration_seconds=None,
             )
-            self._save_result(self._results[result_id])
-            logger.info("[%s] STAGE -> %s (%.0f%%): %s", result_id, stage.value, progress, message)
+        )
+
+    def _finish_stage_timing(
+        self,
+        status: PipelineStatus,
+        stage: PipelineStage,
+        now: float,
+    ) -> float:
+        timing = self._find_stage_timing(status, stage)
+
+        if timing is None:
+            return 0.0
+
+        if timing.started_at is None:
+            timing.started_at = now
+
+        duration = max(0.0, now - timing.started_at)
+
+        timing.completed_at = now
+        timing.duration_seconds = round(duration, 3)
+
+        return duration
+
+    def _completed_stage_timings(
+        self,
+        status: PipelineStatus,
+    ) -> list[StageTiming]:
+        return [
+            timing
+            for timing in status.stage_timings
+            if timing.duration_seconds is not None
+        ]
+
+    # ------------------------------------------------------------------
+    # ETA calculation
+    # ------------------------------------------------------------------
+
+    def _estimate_stage_duration(
+        self,
+        status: PipelineStatus,
+        stage: PipelineStage,
+    ) -> tuple[Optional[float], str]:
+        """
+        Estimate the duration of a stage.
+
+        Priority:
+        1. Actual completed timing from the current inference.
+        2. Default stage estimate.
+
+        The default is deliberately stage-specific. We never derive ETA
+        simply from elapsed_time / percentage.
+        """
+
+        timing = self._find_stage_timing(status, stage)
+
+        if timing and timing.duration_seconds is not None:
+            return timing.duration_seconds, "observed"
+
+        default = self.DEFAULT_STAGE_ESTIMATES.get(stage)
+
+        if default is not None:
+            return default, "weighted"
+
+        return None, "calculating"
+
+    def _estimate_remaining_time(
+        self,
+        status: PipelineStatus,
+        current_stage: PipelineStage,
+        current_stage_fraction: float = 0.0,
+    ) -> tuple[Optional[float], str]:
+        """
+        Estimate remaining pipeline time.
+
+        Current stage:
+            Uses observed progress within that stage when available.
+
+        Future stages:
+            Uses actual historical timing from this inference when
+            available, otherwise stage-specific weighted estimates.
+
+        This intentionally does NOT use:
+            elapsed / overall_progress
+        """
+
+        if current_stage in (PipelineStage.COMPLETE, PipelineStage.ERROR):
+            return 0.0, "complete"
+
+        current_estimate, current_source = self._estimate_stage_duration(
+            status,
+            current_stage,
+        )
+
+        remaining = 0.0
+        confidence = "weighted"
+
+        # Estimate remaining portion of the current stage.
+        if current_estimate is not None:
+            fraction = max(0.0, min(1.0, current_stage_fraction))
+
+            if fraction > 0:
+                remaining += current_estimate * (1.0 - fraction)
+            else:
+                remaining += current_estimate
+
+            if current_source == "observed":
+                confidence = "observed"
+
+        else:
+            # We cannot produce a trustworthy ETA yet.
+            return None, "calculating"
+
+        current_order = self._stage_index(current_stage)
+
+        # Add future stage estimates.
+        for stage_info in self.PIPELINE_STAGES:
+            if stage_info.order <= current_order:
+                continue
+
+            future_stage = PipelineStage(stage_info.key)
+
+            if future_stage == PipelineStage.COMPLETE:
+                continue
+
+            duration, source = self._estimate_stage_duration(
+                status,
+                future_stage,
+            )
+
+            if duration is None:
+                return None, "calculating"
+
+            remaining += duration
+
+            if source == "observed":
+                confidence = "observed"
+
+        return max(0.0, remaining), confidence
+
+    # ------------------------------------------------------------------
+    # Status updates
+    # ------------------------------------------------------------------
+
+    def _update_status(
+        self,
+        result_id: str,
+        stage: PipelineStage,
+        progress: float,
+        message: str,
+        *,
+        stage_fraction: Optional[float] = None,
+        start_stage: bool = False,
+        finish_stage: bool = False,
+    ) -> None:
+        """
+        Update pipeline state and persist it immediately.
+
+        Progress comes from actual backend stage execution.
+
+        For Evidence Retrieval and Step Verification, stage_fraction
+        represents the actual number of completed steps inside that stage.
+        """
+
+        result = self._results.get(result_id)
+
+        if result is None:
+            return
+
+        status = result.pipeline_status
+        now = time.time()
+
+        if status.started_at is None:
+            status.started_at = now
+
+        # Start a new stage when requested.
+        if start_stage:
+            self._start_stage_timing(status, stage, now)
+
+        # Finish the stage when requested.
+        if finish_stage:
+            self._finish_stage_timing(status, stage, now)
+
+        # If a stage has not been explicitly started yet, start it.
+        if self._find_stage_timing(status, stage) is None:
+            self._start_stage_timing(status, stage, now)
+
+        # Current elapsed time.
+        status.elapsed_seconds = round(
+            max(0.0, now - status.started_at),
+            3,
+        )
+
+        current_timing = self._find_stage_timing(status, stage)
+
+        if current_timing and current_timing.started_at is not None:
+            if current_timing.duration_seconds is not None:
+                status.current_stage_elapsed_seconds = round(
+                    current_timing.duration_seconds,
+                    3,
+                )
+            else:
+                status.current_stage_elapsed_seconds = round(
+                    max(0.0, now - current_timing.started_at),
+                    3,
+                )
+
+        # Determine completed stages.
+        completed_stage_count = sum(
+            1
+            for timing in status.stage_timings
+            if timing.duration_seconds is not None
+        )
+
+        # COMPLETE itself is considered the final completed stage.
+        if stage == PipelineStage.COMPLETE:
+            completed_stage_count = len(self.PIPELINE_STAGES)
+
+        status.completed_stages = min(
+            completed_stage_count,
+            len(self.PIPELINE_STAGES),
+        )
+
+        status.stage = stage
+        status.stage_index = self._stage_index(stage)
+        status.total_stages = len(self.PIPELINE_STAGES)
+        status.progress = max(0.0, min(100.0, progress))
+        status.message = message
+        status.stages = list(self.PIPELINE_STAGES)
+
+        # ETA.
+        if stage == PipelineStage.COMPLETE:
+            status.estimated_remaining_seconds = 0.0
+            status.eta_confidence = "complete"
+
+        elif stage == PipelineStage.ERROR:
+            status.estimated_remaining_seconds = None
+            status.eta_confidence = "unavailable"
+
+        else:
+            remaining, confidence = self._estimate_remaining_time(
+                status,
+                stage,
+                stage_fraction or 0.0,
+            )
+
+            status.estimated_remaining_seconds = (
+                round(remaining, 1)
+                if remaining is not None
+                else None
+            )
+            status.eta_confidence = confidence
+
+        self._save_result(result)
+
+        logger.info(
+            "[%s] STAGE -> %s | %.1f%% | stage=%d/%d | "
+            "elapsed=%.2fs | eta=%s | %s",
+            result_id,
+            stage.value,
+            status.progress,
+            status.stage_index,
+            status.total_stages,
+            status.elapsed_seconds,
+            (
+                f"{status.estimated_remaining_seconds:.1f}s"
+                if status.estimated_remaining_seconds is not None
+                else "calculating"
+            ),
+            message,
+        )
+
+    # ------------------------------------------------------------------
+    # Progress calculation
+    # ------------------------------------------------------------------
+
+    def _stage_progress(
+        self,
+        stage: PipelineStage,
+        fraction: float = 0.0,
+    ) -> float:
+        """
+        Convert actual stage execution into overall progress.
+
+        Example:
+            Stage 3 of 8, 50% through stage
+            => 31.25% overall
+
+        This is stage-based progress, not elapsed-time extrapolation.
+        """
+
+        total = len(self.PIPELINE_STAGES)
+
+        if stage == PipelineStage.COMPLETE:
+            return 100.0
+
+        order = self._stage_index(stage)
+
+        if order <= 0:
+            return 0.0
+
+        fraction = max(0.0, min(1.0, fraction))
+
+        progress = ((order - 1) + fraction) / total * 100.0
+
+        return round(progress, 1)
+
+    # ------------------------------------------------------------------
+    # Pipeline execution
+    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -81,8 +542,20 @@ class HeraPipeline:
         result_id: Optional[str] = None,
     ) -> HeraResult:
         result_id = result_id or str(uuid.uuid4())
+
         pipeline_start = time.time()
+
+        # Image loading is part of pipeline startup, but the current backend
+        # does not expose it as a separate executable stage. We therefore do
+        # not fabricate an additional UI stage for it.
         image = load_image(image_path)
+
+        initial_status = self._default_status(
+            PipelineStage.COT_GENERATION,
+            progress=0.0,
+            message="Starting HERA pipeline...",
+            started_at=pipeline_start,
+        )
 
         result = HeraResult(
             result_id=result_id,
@@ -95,163 +568,452 @@ class HeraPipeline:
             final_answer="",
             hallucination_score=0.0,
             confidence_score=0.0,
-            pipeline_status=PipelineStatus(stage=PipelineStage.COT_GENERATION, progress=10, message="Generating CoT..."),
+            pipeline_status=initial_status,
         )
+
         self._results[result_id] = result
         self._save_result(result)
 
         try:
+            # ============================================================
             # Stage 1: CoT Generation
-            stage_start = time.time()
+            # ============================================================
+
             logger.info("[%s] START CoTGeneration", result_id)
-            self._update_status(result_id, PipelineStage.COT_GENERATION, 15, "Generating Chain-of-Thought...")
+
+            self._update_status(
+                result_id,
+                PipelineStage.COT_GENERATION,
+                self._stage_progress(
+                    PipelineStage.COT_GENERATION,
+                    0.0,
+                ),
+                "Generating Chain-of-Thought...",
+                stage_fraction=0.0,
+                start_stage=True,
+            )
+
             original_cot = cot_generator.generate(image, question)
+
             result.original_cot = original_cot
             self._save_result(result)
-            logger.info(
-                "[%s] END CoTGeneration | %.2fs | chars=%d",
-                result_id, time.time() - stage_start, len(original_cot),
+
+            self._update_status(
+                result_id,
+                PipelineStage.COT_GENERATION,
+                self._stage_progress(
+                    PipelineStage.COT_GENERATION,
+                    1.0,
+                ),
+                "Chain-of-Thought generation complete.",
+                stage_fraction=1.0,
+                finish_stage=True,
             )
 
-            # Parse structured sections once. The <OBSERVATIONS> text is the
-            # VLM's real, grounded description of the image ("holding bouquet
-            # of flowers", etc). Previously this was only extracted as a
-            # fallback when step segmentation failed, so the retriever never
-            # got to use it as evidence. Now it's always extracted and threaded
-            # into every step's evidence retrieval below.
+            # Parse structured sections once.
             sections = parse_cot_sections(original_cot)
+
             observations = sections.get("observations", "")
+
             logger.info(
-                "[%s] Parsed CoT sections: observations=%d chars, reasoning=%s, conclusion=%s",
-                result_id, len(observations), "observations" in sections, "conclusion" in sections,
+                "[%s] Parsed CoT sections: observations=%d chars, "
+                "reasoning=%s, conclusion=%s",
+                result_id,
+                len(observations),
+                "observations" in sections,
+                "conclusion" in sections,
             )
 
+            # ============================================================
             # Stage 2: Step Segmentation
-            stage_start = time.time()
+            # ============================================================
+
             logger.info("[%s] START StepSegmentation", result_id)
-            self._update_status(result_id, PipelineStage.STEP_SEGMENTATION, 30, "Segmenting reasoning steps...")
-            reasoning_text = sections.get("reasoning", original_cot)
-            step_texts = segment_reasoning_steps(reasoning_text)
-            if not step_texts:
-                step_texts = segment_reasoning_steps(original_cot) or [original_cot[:500]]
-            logger.info(
-                "[%s] END StepSegmentation | %.2fs | reasoning_count=%d",
-                result_id, time.time() - stage_start, len(step_texts),
+
+            self._update_status(
+                result_id,
+                PipelineStage.STEP_SEGMENTATION,
+                self._stage_progress(
+                    PipelineStage.STEP_SEGMENTATION,
+                    0.0,
+                ),
+                "Segmenting reasoning steps...",
+                stage_fraction=0.0,
+                start_stage=True,
             )
 
-            # Stage 3-5: Per-step retrieval, verification, attribution
-            logger.info("[%s] START EvidenceRetrieval+Verification (%d steps)", result_id, len(step_texts))
-            loop_start = time.time()
-            verified_steps = []
+            reasoning_text = sections.get(
+                "reasoning",
+                original_cot,
+            )
+
+            step_texts = segment_reasoning_steps(reasoning_text)
+
+            if not step_texts:
+                step_texts = (
+                    segment_reasoning_steps(original_cot)
+                    or [original_cot[:500]]
+                )
+
+            logger.info(
+                "[%s] Step segmentation produced %d steps",
+                result_id,
+                len(step_texts),
+            )
+
+            self._update_status(
+                result_id,
+                PipelineStage.STEP_SEGMENTATION,
+                self._stage_progress(
+                    PipelineStage.STEP_SEGMENTATION,
+                    1.0,
+                ),
+                f"Segmented {len(step_texts)} reasoning steps.",
+                stage_fraction=1.0,
+                finish_stage=True,
+            )
+
+            # ============================================================
+            # Stage 3: Evidence Retrieval
+            # ============================================================
+
+            logger.info(
+                "[%s] START EvidenceRetrieval (%d steps)",
+                result_id,
+                len(step_texts),
+            )
+
+            self._update_status(
+                result_id,
+                PipelineStage.EVIDENCE_RETRIEVAL,
+                self._stage_progress(
+                    PipelineStage.EVIDENCE_RETRIEVAL,
+                    0.0,
+                ),
+                f"Preparing evidence retrieval for {len(step_texts)} steps...",
+                stage_fraction=0.0,
+                start_stage=True,
+            )
+
+            retrieved_evidence: list[tuple] = []
+
             for i, step_text in enumerate(step_texts):
-                progress = 30 + (50 * (i + 1) / len(step_texts))
+                visual_ev, textual_ev = evidence_retriever.retrieve_for_step(
+                    step_text,
+                    image,
+                    question,
+                    i,
+                    observations=observations,
+                )
+
+                retrieved_evidence.append(
+                    (
+                        visual_ev,
+                        textual_ev,
+                    )
+                )
+
+                fraction = (i + 1) / len(step_texts)
+
                 self._update_status(
                     result_id,
                     PipelineStage.EVIDENCE_RETRIEVAL,
-                    progress,
-                    f"Processing step {i + 1}/{len(step_texts)}...",
+                    self._stage_progress(
+                        PipelineStage.EVIDENCE_RETRIEVAL,
+                        fraction,
+                    ),
+                    f"Retrieved evidence for step {i + 1}/{len(step_texts)}.",
+                    stage_fraction=fraction,
                 )
 
-                visual_ev, textual_ev = evidence_retriever.retrieve_for_step(
-                    step_text, image, question, i, observations=observations
+            self._update_status(
+                result_id,
+                PipelineStage.EVIDENCE_RETRIEVAL,
+                self._stage_progress(
+                    PipelineStage.EVIDENCE_RETRIEVAL,
+                    1.0,
+                ),
+                "Evidence retrieval complete.",
+                stage_fraction=1.0,
+                finish_stage=True,
+            )
+
+            # ============================================================
+            # Stage 4: Step Verification
+            # ============================================================
+
+            logger.info(
+                "[%s] START StepVerification (%d steps)",
+                result_id,
+                len(step_texts),
+            )
+
+            self._update_status(
+                result_id,
+                PipelineStage.STEP_VERIFICATION,
+                self._stage_progress(
+                    PipelineStage.STEP_VERIFICATION,
+                    0.0,
+                ),
+                f"Preparing verification for {len(step_texts)} steps...",
+                stage_fraction=0.0,
+                start_stage=True,
+            )
+
+            verified_steps = []
+
+            for i, step_text in enumerate(step_texts):
+                visual_ev, textual_ev = retrieved_evidence[i]
+
+                step_result = hallucination_detector.verify_step(
+                    i,
+                    step_text,
+                    visual_ev,
+                    textual_ev,
                 )
+
+                verified_steps.append(step_result)
+
+                fraction = (i + 1) / len(step_texts)
 
                 self._update_status(
                     result_id,
                     PipelineStage.STEP_VERIFICATION,
-                    progress + 5,
-                    f"Verifying step {i + 1}/{len(step_texts)}...",
+                    self._stage_progress(
+                        PipelineStage.STEP_VERIFICATION,
+                        fraction,
+                    ),
+                    f"Verified step {i + 1}/{len(step_texts)}.",
+                    stage_fraction=fraction,
                 )
-
-                step_result = hallucination_detector.verify_step(
-                    i, step_text, visual_ev, textual_ev
-                )
-                verified_steps.append(step_result)
 
             result.steps = verified_steps
             self._save_result(result)
-            logger.info(
-                "[%s] END EvidenceRetrieval+Verification | %.2fs | steps=%d",
-                result_id, time.time() - loop_start, len(verified_steps),
+
+            self._update_status(
+                result_id,
+                PipelineStage.STEP_VERIFICATION,
+                self._stage_progress(
+                    PipelineStage.STEP_VERIFICATION,
+                    1.0,
+                ),
+                "Step verification complete.",
+                stage_fraction=1.0,
+                finish_stage=True,
             )
 
-            # Stage 6: Hallucination Detection (aggregate)
-            stage_start = time.time()
-            logger.info("[%s] START HallucinationDetection", result_id)
+            # ============================================================
+            # Stage 5: Hallucination Detection
+            # ============================================================
+
+            logger.info(
+                "[%s] START HallucinationDetection",
+                result_id,
+            )
+
             self._update_status(
                 result_id,
                 PipelineStage.HALLUCINATION_DETECTION,
-                85,
+                self._stage_progress(
+                    PipelineStage.HALLUCINATION_DETECTION,
+                    0.0,
+                ),
                 "Computing hallucination scores...",
-            )
-            hallucinated = sum(1 for s in verified_steps if not s.supported)
-            supported_count = len(verified_steps) - hallucinated
-            result.hallucination_score = round(hallucinated / max(len(verified_steps), 1), 3)
-            result.confidence_score = round(
-                sum(s.confidence for s in verified_steps) / max(len(verified_steps), 1),
-                3,
-            )
-            self._save_result(result)
-            logger.info(
-                "[%s] END HallucinationDetection | %.2fs | supported=%d | hallucinated=%d | "
-                "hallucination_score=%.3f | confidence_score=%.3f",
-                result_id, time.time() - stage_start, supported_count, hallucinated,
-                result.hallucination_score, result.confidence_score,
+                stage_fraction=0.0,
+                start_stage=True,
             )
 
-            # Stage 7: Evidence Attribution
-            stage_start = time.time()
-            logger.info("[%s] START EvidenceAttribution", result_id)
+            hallucinated = sum(
+                1
+                for step in verified_steps
+                if not step.supported
+            )
+
+            supported_count = len(verified_steps) - hallucinated
+
+            result.hallucination_score = round(
+                hallucinated / max(len(verified_steps), 1),
+                3,
+            )
+
+            result.confidence_score = round(
+                sum(
+                    step.confidence
+                    for step in verified_steps
+                ) / max(len(verified_steps), 1),
+                3,
+            )
+
+            self._save_result(result)
+
+            self._update_status(
+                result_id,
+                PipelineStage.HALLUCINATION_DETECTION,
+                self._stage_progress(
+                    PipelineStage.HALLUCINATION_DETECTION,
+                    1.0,
+                ),
+                "Hallucination analysis complete.",
+                stage_fraction=1.0,
+                finish_stage=True,
+            )
+
+            # ============================================================
+            # Stage 6: Evidence Attribution
+            # ============================================================
+
+            logger.info(
+                "[%s] START EvidenceAttribution",
+                result_id,
+            )
+
             self._update_status(
                 result_id,
                 PipelineStage.EVIDENCE_ATTRIBUTION,
-                90,
+                self._stage_progress(
+                    PipelineStage.EVIDENCE_ATTRIBUTION,
+                    0.0,
+                ),
                 "Building evidence-attributed CoT...",
-            )
-            result.attributed_cot = evidence_attributor.attribute_steps(verified_steps)
-            self._save_result(result)
-            logger.info(
-                "[%s] END EvidenceAttribution | %.2fs | chars=%d",
-                result_id, time.time() - stage_start, len(result.attributed_cot),
+                stage_fraction=0.0,
+                start_stage=True,
             )
 
-            # Stage 8: Reasoning Correction
-            stage_start = time.time()
-            logger.info("[%s] START ReasoningCorrection", result_id)
+            result.attributed_cot = evidence_attributor.attribute_steps(
+                verified_steps
+            )
+
+            self._save_result(result)
+
+            self._update_status(
+                result_id,
+                PipelineStage.EVIDENCE_ATTRIBUTION,
+                self._stage_progress(
+                    PipelineStage.EVIDENCE_ATTRIBUTION,
+                    1.0,
+                ),
+                "Evidence attribution complete.",
+                stage_fraction=1.0,
+                finish_stage=True,
+            )
+
+            # ============================================================
+            # Stage 7: Reasoning Correction
+            # ============================================================
+
+            logger.info(
+                "[%s] START ReasoningCorrection",
+                result_id,
+            )
+
             self._update_status(
                 result_id,
                 PipelineStage.REASONING_CORRECTION,
-                95,
+                self._stage_progress(
+                    PipelineStage.REASONING_CORRECTION,
+                    0.0,
+                ),
                 "Generating corrected reasoning...",
-            )
-            corrected_cot, final_answer = reasoning_corrector.correct(
-                original_cot, verified_steps, question
-            )
-            result.corrected_cot = corrected_cot
-            result.final_answer = final_answer
-            logger.info(
-                "[%s] END ReasoningCorrection | %.2fs | final_answer=%r",
-                result_id, time.time() - stage_start, final_answer[:120],
+                stage_fraction=0.0,
+                start_stage=True,
             )
 
-            result.pipeline_status = PipelineStatus(
-                stage=PipelineStage.COMPLETE,
-                progress=100,
-                message="Pipeline complete",
+            corrected_cot, final_answer = reasoning_corrector.correct(
+                original_cot,
+                verified_steps,
+                question,
             )
+
+            result.corrected_cot = corrected_cot
+            result.final_answer = final_answer
+
             self._save_result(result)
+
+            self._update_status(
+                result_id,
+                PipelineStage.REASONING_CORRECTION,
+                self._stage_progress(
+                    PipelineStage.REASONING_CORRECTION,
+                    1.0,
+                ),
+                "Corrected reasoning generated.",
+                stage_fraction=1.0,
+                finish_stage=True,
+            )
+
+            # ============================================================
+            # Stage 8: Complete
+            # ============================================================
+
+            self._update_status(
+                result_id,
+                PipelineStage.COMPLETE,
+                100.0,
+                "Pipeline complete.",
+                stage_fraction=1.0,
+            )
+
+            # Ensure the total elapsed time is captured at completion.
+            result.pipeline_status.elapsed_seconds = round(
+                max(0.0, time.time() - pipeline_start),
+                3,
+            )
+
+            result.pipeline_status.current_stage_elapsed_seconds = 0.0
+            result.pipeline_status.estimated_remaining_seconds = 0.0
+            result.pipeline_status.eta_confidence = "complete"
+            result.pipeline_status.completed_stages = len(
+                self.PIPELINE_STAGES
+            )
+            result.pipeline_status.stage_index = len(
+                self.PIPELINE_STAGES
+            )
+            result.pipeline_status.total_stages = len(
+                self.PIPELINE_STAGES
+            )
+
+            self._save_result(result)
+
             logger.info(
-                "[%s] Pipeline complete | total=%.2fs | steps=%d | supported=%d | hallucinated=%d",
-                result_id, time.time() - pipeline_start, len(verified_steps), supported_count, hallucinated,
+                "[%s] Pipeline complete | total=%.2fs | steps=%d | "
+                "supported=%d | hallucinated=%d",
+                result_id,
+                result.pipeline_status.elapsed_seconds,
+                len(verified_steps),
+                supported_count,
+                hallucinated,
             )
 
         except Exception as e:
-            logger.exception("[%s] Pipeline failed: %s", result_id, e)
+            logger.exception(
+                "[%s] Pipeline failed: %s",
+                result_id,
+                e,
+            )
+
             result.pipeline_status = PipelineStatus(
                 stage=PipelineStage.ERROR,
                 progress=0,
                 message=str(e),
+                stages=list(self.PIPELINE_STAGES),
+                stage_index=0,
+                total_stages=len(self.PIPELINE_STAGES),
+                completed_stages=sum(
+                    1
+                    for timing in result.pipeline_status.stage_timings
+                    if timing.duration_seconds is not None
+                ),
+                started_at=result.pipeline_status.started_at,
+                elapsed_seconds=round(
+                    max(0.0, time.time() - pipeline_start),
+                    3,
+                ),
+                current_stage_elapsed_seconds=0.0,
+                estimated_remaining_seconds=None,
+                eta_confidence="unavailable",
+                stage_timings=result.pipeline_status.stage_timings,
             )
+
             self._save_result(result)
 
         return result

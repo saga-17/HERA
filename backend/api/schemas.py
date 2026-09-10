@@ -71,10 +71,57 @@ class ReasoningStepResult(BaseModel):
     extraction: EntityExtraction = Field(default_factory=EntityExtraction)
 
 
+class PipelineStageInfo(BaseModel):
+    """
+    Describes an actual executable stage exposed by the backend.
+
+    The frontend should use this list instead of maintaining its own
+    independent/hardcoded pipeline definition.
+    """
+
+    key: str
+    label: str
+    order: int
+
+
+class StageTiming(BaseModel):
+    """
+    Timing information for one pipeline stage.
+
+    duration_seconds is populated when the stage finishes.
+    """
+
+    stage: PipelineStage
+    label: str
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    duration_seconds: Optional[float] = None
+
+
 class PipelineStatus(BaseModel):
     stage: PipelineStage
     progress: float = 0.0
     message: str = ""
+
+    # Backend-provided stage definition.
+    stages: list[PipelineStageInfo] = Field(default_factory=list)
+
+    # Current stage position.
+    stage_index: int = 0
+    total_stages: int = 0
+    completed_stages: int = 0
+
+    # Timing.
+    started_at: Optional[float] = None
+    elapsed_seconds: float = 0.0
+    current_stage_elapsed_seconds: float = 0.0
+
+    # ETA.
+    estimated_remaining_seconds: Optional[float] = None
+    eta_confidence: str = "calculating"
+
+    # Timing history for this inference.
+    stage_timings: list[StageTiming] = Field(default_factory=list)
 
 
 class UploadResponse(BaseModel):
@@ -106,7 +153,10 @@ class HeraResult(BaseModel):
     confidence_score: float
     steps: list[ReasoningStepResult] = Field(default_factory=list)
     pipeline_status: PipelineStatus = Field(
-        default_factory=lambda: PipelineStatus(stage=PipelineStage.COMPLETE, progress=100.0)
+        default_factory=lambda: PipelineStatus(
+            stage=PipelineStage.COMPLETE,
+            progress=100.0,
+        )
     )
 
 

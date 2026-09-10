@@ -47,10 +47,44 @@ export interface ReasoningStep {
   extraction: EntityExtraction;
 }
 
+export interface PipelineStageInfo {
+  key: string;
+  label: string;
+  order: number;
+}
+
+export interface StageTiming {
+  stage: string;
+  label: string;
+  started_at?: number | null;
+  completed_at?: number | null;
+  duration_seconds?: number | null;
+}
+
 export interface PipelineStatus {
   stage: string;
   progress: number;
   message: string;
+
+  // Actual backend pipeline definition.
+  stages: PipelineStageInfo[];
+
+  // Current stage position.
+  stage_index: number;
+  total_stages: number;
+  completed_stages: number;
+
+  // Timing.
+  started_at?: number | null;
+  elapsed_seconds: number;
+  current_stage_elapsed_seconds: number;
+
+  // ETA.
+  estimated_remaining_seconds?: number | null;
+  eta_confidence: "calculating" | "weighted" | "observed" | "complete" | "unavailable";
+
+  // Timing information for completed/current stages.
+  stage_timings: StageTiming[];
 }
 
 export interface HeraResult {
