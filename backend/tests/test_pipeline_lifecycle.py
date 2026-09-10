@@ -1,8 +1,17 @@
 import threading
 import unittest
 
-from backend.api.schemas import HeraResult, PipelineStage, PipelineStatus
+from backend.api.schemas import (
+    EntityExtraction,
+    HallucinationType,
+    HeraResult,
+    PipelineStage,
+    PipelineStatus,
+    ReasoningStepResult,
+    StepStatus,
+)
 from backend.pipelines.hera_pipeline import HeraPipeline
+from backend.services.reasoning_corrector import ReasoningCorrector
 
 
 class TestPipelineLifecycle(unittest.TestCase):
@@ -45,6 +54,42 @@ class TestPipelineLifecycle(unittest.TestCase):
 
         self.assertTrue(self.pipeline.has_active_run_for_request("img-2", "Describe the scene"))
         self.assertFalse(self.pipeline.has_active_run_for_request("img-2", "Different question"))
+
+    def test_final_answer_is_complete_and_explicitly_verified(self):
+        long_step = (
+            "The person is holding a bouquet of flowers with multiple pink and white flowers "
+            "in the foreground while standing in a bright indoor setting, and the arrangement "
+            "occupies a large portion of the frame and is clearly visible as a bouquet."
+        )
+        steps = [
+            ReasoningStepResult(
+                step_index=0,
+                step=long_step,
+                status=StepStatus.SUPPORTED,
+                confidence=0.94,
+                supported=True,
+                hallucination_type=HallucinationType.NONE,
+                evidence="Visual evidence clearly shows a bouquet of flowers in the person's hands.",
+                visual_evidence=[],
+                textual_evidence=[],
+                attribution="The bouquet occupies the foreground and matches the described object.",
+                extraction=EntityExtraction(),
+            )
+        ]
+
+        final_answer = ReasoningCorrector()._generate_final_answer(
+            original_cot="<CONCLUSION>\nFinal Answer: The person is holding a bouquet of flowers.\n</CONCLUSION>",
+            supported_steps=steps,
+            question="What is the person holding?",
+            hallucinated_count=0,
+        )
+
+        self.assertIn("Answer:", final_answer)
+        self.assertIn("Verification:", final_answer)
+        self.assertIn("SUPPORTED", final_answer)
+        self.assertNotIn("...", final_answer)
+        self.assertFalse(final_answer.rstrip().endswith("..."))
+        self.assertIn("bouquet of flowers", final_answer.lower())
 
 
 if __name__ == "__main__":
