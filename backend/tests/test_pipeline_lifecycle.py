@@ -55,41 +55,189 @@ class TestPipelineLifecycle(unittest.TestCase):
         self.assertTrue(self.pipeline.has_active_run_for_request("img-2", "Describe the scene"))
         self.assertFalse(self.pipeline.has_active_run_for_request("img-2", "Different question"))
 
-    def test_final_answer_is_complete_and_explicitly_verified(self):
-        long_step = (
-            "The person is holding a bouquet of flowers with multiple pink and white flowers "
-            "in the foreground while standing in a bright indoor setting, and the arrangement "
-            "occupies a large portion of the frame and is clearly visible as a bouquet."
-        )
+    def test_final_answer_is_semantic_and_clean(self):
+        test_cases = [
+            (
+                "Is this a leg?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="The object is a dog, not a leg.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.94,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="Visual evidence shows a dog.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="The animal shape matches a dog.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "Wrong. It is not a leg; it is a dog.",
+            ),
+            (
+                "What is this?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="It is a dog.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.94,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="The image contains a dog.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="The animal is a dog.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "It is a dog.",
+            ),
+            (
+                "What animals are present?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="Dogs, rabbits, foxes, beavers, and mice are visible in the scene.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.95,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="Multiple animals are visible.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="The evidence supports multiple animals.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "The image contains dogs, rabbits, foxes, beavers, and mice.",
+            ),
+            (
+                "Is this a dog?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="This is a dog.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.93,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="The image shows a dog.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="The recognized animal is a dog.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "Right. It is a dog.",
+            ),
+            (
+                "How many dogs are there?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="There are three dogs in the image.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.91,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="Three dogs are visible.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="Multiple dogs are visible in the scene.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "There are 3 dogs.",
+            ),
+            (
+                "Is the dog next to the person?",
+                [
+                    ReasoningStepResult(
+                        step_index=0,
+                        step="The dog is next to the person.",
+                        status=StepStatus.SUPPORTED,
+                        confidence=0.90,
+                        supported=True,
+                        hallucination_type=HallucinationType.NONE,
+                        evidence="The dog is adjacent to the person.",
+                        visual_evidence=[],
+                        textual_evidence=[],
+                        attribution="The dog and person are side by side.",
+                        extraction=EntityExtraction(),
+                    )
+                ],
+                "Yes, the dog is next to the person.",
+            ),
+            (
+                "Is this a leg?",
+                [],
+                "I can't determine that reliably from the image.",
+            ),
+        ]
+
+        for question, steps, expected in test_cases:
+            with self.subTest(question=question):
+                final_answer = ReasoningCorrector()._generate_final_answer(
+                    original_cot="<CONCLUSION>\nFinal Answer: The model says it is a dog.\n</CONCLUSION>",
+                    supported_steps=steps,
+                    question=question,
+                    hallucinated_count=0,
+                )
+
+                self.assertNotIn("Answer:", final_answer)
+                self.assertNotIn("Verification:", final_answer)
+                self.assertNotIn("Confidence:", final_answer)
+                self.assertNotIn("Evidence:", final_answer)
+                self.assertNotIn("Reasoning:", final_answer)
+                self.assertNotIn("(conf=", final_answer)
+                self.assertNotIn("[Visual]", final_answer)
+                self.assertNotIn("[Text]", final_answer)
+                self.assertNotIn("...", final_answer)
+                self.assertFalse(final_answer.rstrip().endswith("..."))
+                self.assertTrue(final_answer.strip().startswith(expected.split()[0]) or expected in final_answer)
+
+                if question == "What animals are present?":
+                    self.assertIn("dogs", final_answer.lower())
+                if question == "Is this a leg?" and not steps:
+                    self.assertEqual(final_answer, expected)
+                elif question != "Is this a leg?":
+                    self.assertIn(expected.lower(), final_answer.lower())
+
+    def test_hallucinated_cot_does_not_bleed_into_final_answer(self):
         steps = [
             ReasoningStepResult(
                 step_index=0,
-                step=long_step,
+                step="The image shows a dog in the center of the scene.",
                 status=StepStatus.SUPPORTED,
-                confidence=0.94,
+                confidence=0.96,
                 supported=True,
                 hallucination_type=HallucinationType.NONE,
-                evidence="Visual evidence clearly shows a bouquet of flowers in the person's hands.",
+                evidence="Visual evidence supports the dog.",
                 visual_evidence=[],
                 textual_evidence=[],
-                attribution="The bouquet occupies the foreground and matches the described object.",
+                attribution="The dog is directly visible.",
                 extraction=EntityExtraction(),
             )
         ]
 
         final_answer = ReasoningCorrector()._generate_final_answer(
-            original_cot="<CONCLUSION>\nFinal Answer: The person is holding a bouquet of flowers.\n</CONCLUSION>",
+            original_cot="<CONCLUSION>\nFinal Answer: The dog is a fish and the scene is underwater.\n</CONCLUSION>",
             supported_steps=steps,
-            question="What is the person holding?",
-            hallucinated_count=0,
+            question="What is this animal?",
+            hallucinated_count=1,
         )
 
-        self.assertIn("Answer:", final_answer)
-        self.assertIn("Verification:", final_answer)
-        self.assertIn("SUPPORTED", final_answer)
-        self.assertNotIn("...", final_answer)
-        self.assertFalse(final_answer.rstrip().endswith("..."))
-        self.assertIn("bouquet of flowers", final_answer.lower())
+        self.assertNotIn("fish", final_answer.lower())
+        self.assertNotIn("underwater", final_answer.lower())
+        self.assertIn("dog", final_answer.lower())
+        self.assertNotIn("Verification:", final_answer)
+        self.assertNotIn("Confidence:", final_answer)
+        self.assertNotIn("Evidence:", final_answer)
+        self.assertNotIn("(conf=", final_answer)
+        self.assertFalse(final_answer.strip().endswith("..."))
 
 
 if __name__ == "__main__":
