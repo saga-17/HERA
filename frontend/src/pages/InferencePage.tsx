@@ -135,13 +135,15 @@ export default function InferencePage() {
     setError(null);
   };
 
-  const isComplete = result?.pipeline_status.stage === "complete";
+  const backendComplete = result?.pipeline_status.stage === "complete";
+  const visualProgressComplete = (result?.pipeline_status.progress ?? 0) >= 99.9;
+  const canNavigateToResult = Boolean(resultId && backendComplete && visualProgressComplete);
 
   useEffect(() => {
-    if (isComplete && resultId) {
+    if (canNavigateToResult) {
       navigate(`/result/${resultId}`);
     }
-  }, [isComplete, resultId, navigate]);
+  }, [canNavigateToResult, resultId, navigate]);
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">

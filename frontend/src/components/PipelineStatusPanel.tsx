@@ -31,26 +31,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function formatDuration(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) {
-    return "--:--";
-  }
-
-  const totalSeconds = Math.max(0, Math.floor(seconds));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const secs = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(
-      2,
-      "0"
-    )}:${String(secs).padStart(2, "0")}`;
-  }
-
-  return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
 function getStageIndex(status: PipelineStatus | null, currentStage: string): number {
   if (!status?.stages?.length) {
     return 0;
@@ -99,12 +79,6 @@ export default function PipelineStatusPanel({
   const [displayProgress, setDisplayProgress] = useState<number>(() =>
     clamp(status?.progress ?? 0, 0, 100)
   );
-  const [displayElapsedSeconds, setDisplayElapsedSeconds] = useState<number>(() =>
-    status?.elapsed_seconds ?? 0
-  );
-  const [displayEtaSeconds, setDisplayEtaSeconds] = useState<number | null>(() =>
-    status?.estimated_remaining_seconds ?? null
-  );
 
   const lastStageRef = useRef<string>(currentStage);
   const stageStartRef = useRef<number | null>(null);
@@ -116,23 +90,17 @@ export default function PipelineStatusPanel({
 
     if (!status) {
       setDisplayProgress(0);
-      setDisplayElapsedSeconds(0);
-      setDisplayEtaSeconds(null);
       return;
     }
 
     if (isComplete) {
       setDisplayProgress(100);
-      setDisplayElapsedSeconds(status.elapsed_seconds ?? 0);
-      setDisplayEtaSeconds(0);
       return;
     }
 
     if (isError || isCancelled) {
       const frozenValue = clamp(status.progress ?? 0, 0, 100);
       setDisplayProgress(frozenValue);
-      setDisplayElapsedSeconds(status.elapsed_seconds ?? 0);
-      setDisplayEtaSeconds(null);
       return;
     }
 
@@ -186,73 +154,7 @@ export default function PipelineStatusPanel({
     isCancelled,
   ]);
 
-  useEffect(() => {
-    if (!status || isComplete || isError || isCancelled) {
-      return;
-    }
-
-    const startedAt = status.started_at;
-    if (startedAt === null || startedAt === undefined || !Number.isFinite(startedAt)) {
-      setDisplayElapsedSeconds(status.elapsed_seconds ?? 0);
-      return;
-    }
-
-    let rafId = 0;
-
-    const tick = () => {
-      setDisplayElapsedSeconds(Math.max(0, Date.now() / 1000 - startedAt));
-      rafId = window.requestAnimationFrame(tick);
-    };
-
-    tick();
-
-    return () => {
-      if (rafId) {
-        window.cancelAnimationFrame(rafId);
-      }
-    };
-  }, [status?.started_at, isComplete, isError, isCancelled]);
-
-  useEffect(() => {
-    if (!status || isComplete || isError || isCancelled) {
-      return;
-    }
-
-    const eta = status.estimated_remaining_seconds;
-    if (eta === null || eta === undefined || !Number.isFinite(eta)) {
-      setDisplayEtaSeconds(null);
-      return;
-    }
-
-    const etaStart = Date.now();
-    const etaBaseline = Math.max(0, eta);
-    let rafId = 0;
-
-    const tick = () => {
-      const elapsedMs = Date.now() - etaStart;
-      const remaining = Math.max(0, etaBaseline - elapsedMs / 1000);
-      setDisplayEtaSeconds(remaining);
-      rafId = window.requestAnimationFrame(tick);
-    };
-
-    tick();
-
-    return () => {
-      if (rafId) {
-        window.cancelAnimationFrame(rafId);
-      }
-    };
-  }, [status?.estimated_remaining_seconds, isComplete, isError, isCancelled]);
-
   const progress = clamp(displayProgress, 0, 100);
-  const elapsedSeconds = displayElapsedSeconds;
-  const etaSeconds = displayEtaSeconds;
-  const showEta =
-    !isComplete &&
-    !isError &&
-    etaSeconds !== null &&
-    etaSeconds !== undefined &&
-    Number.isFinite(etaSeconds);
 
   return (
     <div className="card h-full">
@@ -315,35 +217,6 @@ export default function PipelineStatusPanel({
             <div className="mt-3 text-xs text-slate-400">{status.message}</div>
           )}
 
-          <div className="grid grid-cols-2 gap-3 mt-4">
-            <div className="rounded-lg bg-slate-800/60 border border-slate-700 p-3">
-              <div className="text-xs text-slate-500">Elapsed</div>
-              <div className="text-sm font-semibold text-white mt-1">
-                {formatDuration(elapsedSeconds)}
-              </div>
-            </div>
-
-            <div className="rounded-lg bg-slate-800/60 border border-slate-700 p-3">
-              <div className="text-xs text-slate-500">
-                {isComplete ? "Total Time" : "Estimated Remaining"}
-              </div>
-              <div className="text-sm font-semibold text-white mt-1">
-                {isComplete
-                  ? formatDuration(elapsedSeconds)
-                  : showEta
-                  ? formatDuration(etaSeconds)
-                  : "Calculating..."}
-              </div>
-            </div>
-          </div>
-
-          {isComplete && (
-            <div className="mt-4 rounded-lg bg-green-500/10 border border-green-500/30 px-3 py-2">
-              <span className="text-sm text-green-400 font-medium">
-                Completed in {formatDuration(elapsedSeconds)}
-              </span>
-            </div>
-          )}
           {isCancelled && (
             <div className="mt-4 rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2">
               <span className="text-sm text-amber-300 font-medium">Pipeline cancelled.</span>
@@ -419,7 +292,7 @@ export default function PipelineStatusPanel({
 
                   {hasDuration && (
                     <div className="text-xs text-slate-500 mt-0.5">
-                      {formatDuration(stageTiming?.duration_seconds)}
+                      Stage completed
                     </div>
                   )}
                 </div>

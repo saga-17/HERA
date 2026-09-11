@@ -239,6 +239,91 @@ class TestPipelineLifecycle(unittest.TestCase):
         self.assertNotIn("(conf=", final_answer)
         self.assertFalse(final_answer.strip().endswith("..."))
 
+    def test_eta_is_authoritative_and_not_counted_down_by_client(self):
+        result = HeraResult(
+            result_id="eta-test",
+            image_id="img-eta",
+            image_url="/api/images/img-eta",
+            question="What is in the image?",
+            original_cot="",
+            attributed_cot="",
+            corrected_cot="",
+            final_answer="",
+            hallucination_score=0.0,
+            confidence_score=0.0,
+            pipeline_status=PipelineStatus(
+                stage=PipelineStage.COT_GENERATION,
+                progress=25.0,
+                message="Running",
+                stages=list(HeraPipeline.PIPELINE_STAGES),
+                stage_index=0,
+                total_stages=len(HeraPipeline.PIPELINE_STAGES),
+                completed_stages=0,
+                started_at=1000.0,
+                elapsed_seconds=12.0,
+                current_stage_elapsed_seconds=8.0,
+                estimated_remaining_seconds=24.0,
+                eta_confidence="weighted",
+            ),
+        )
+
+        self.assertGreater(result.pipeline_status.estimated_remaining_seconds or 0, 0)
+        self.assertNotEqual(result.pipeline_status.stage, PipelineStage.COMPLETE)
+
+        pipeline = HeraPipeline()
+        pipeline._results["eta-test"] = result
+        pipeline._update_status(
+            "eta-test",
+            PipelineStage.COT_GENERATION,
+            25.0,
+            "Running",
+            stage_fraction=0.4,
+            start_stage=True,
+        )
+        self.assertGreaterEqual(result.pipeline_status.estimated_remaining_seconds or 0, 0)
+        self.assertNotEqual(result.pipeline_status.stage, PipelineStage.COMPLETE)
+
+        pipeline._update_status(
+            "eta-test",
+            PipelineStage.COMPLETE,
+            100.0,
+            "Pipeline complete.",
+            stage_fraction=1.0,
+        )
+        self.assertEqual(result.pipeline_status.stage, PipelineStage.COMPLETE)
+        self.assertEqual(result.pipeline_status.progress, 100.0)
+        self.assertEqual(result.pipeline_status.estimated_remaining_seconds, 0.0)
+        self.assertEqual(result.pipeline_status.eta_confidence, "complete")
+
+    def test_eta_zero_while_running_is_not_treated_as_completion(self):
+        status = PipelineStatus(
+            stage=PipelineStage.REASONING_CORRECTION,
+            progress=90.0,
+            message="Finishing up",
+            stages=list(HeraPipeline.PIPELINE_STAGES),
+            stage_index=6,
+            total_stages=len(HeraPipeline.PIPELINE_STAGES),
+            completed_stages=6,
+            started_at=1000.0,
+            elapsed_seconds=110.0,
+            current_stage_elapsed_seconds=15.0,
+            estimated_remaining_seconds=0.0,
+            eta_confidence="weighted",
+        )
+
+        self.assertEqual(status.stage, PipelineStage.REASONING_CORRECTION)
+        self.assertEqual(status.estimated_remaining_seconds, 0.0)
+        self.assertNotEqual(status.stage, PipelineStage.COMPLETE)
+
+    def test_stage_progress_clamps_to_100_and_waits_for_complete_stage(self):
+        pipeline = HeraPipeline()
+
+        self.assertEqual(pipeline._stage_progress(PipelineStage.COMPLETE, 0.0), 100.0)
+        self.assertEqual(pipeline._stage_progress(PipelineStage.COMPLETE, 1.0), 100.0)
+        self.assertLess(pipeline._stage_progress(PipelineStage.COT_GENERATION, 1.0), 100.0)
+        self.assertLessEqual(pipeline._stage_progress(PipelineStage.REASONING_CORRECTION, 1.5), 100.0)
+        self.assertNotEqual(pipeline._stage_progress(PipelineStage.REASONING_CORRECTION, 0.0), 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
