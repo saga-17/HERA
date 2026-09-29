@@ -1,0 +1,31 @@
+# HERA-VLM Backend Dependencies
+# Python 3.11 required
+
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# ML / VLM
+torch>=2.1.0
+transformers>=4.45.0
+accelerate>=0.34.0
+bitsandbytes>=0.44.0
+sentence-transformers>=3.3.0
+qwen-vl-utils>=0.0.8
+pillow>=10.4.0
+numpy>=1.26.0
+
+# Retrieval
+rank-bm25>=0.2.2
+duckduckgo-search>=6.3.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiofiles>=24.1.0
+
+# Optional: CaVe-VLM-CoT integration (if using full pipeline modules)
+# langgraph>=0.2.0
+# faiss-cpu>=1.8.0
