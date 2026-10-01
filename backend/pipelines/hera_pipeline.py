@@ -17,6 +17,8 @@ from backend.api.schemas import (
     PipelineStage,
     PipelineStageInfo,
     PipelineStatus,
+    ReasoningStepResult,
+    StepStatus,
     StageTiming,
 )
 from backend.config import settings
@@ -653,6 +655,37 @@ class HeraPipeline:
 
         return round(progress, 1)
 
+    @staticmethod
+    def _verification_metrics(
+        steps: list[ReasoningStepResult],
+    ) -> tuple[float, float, int, int]:
+        """Calculate step-level hallucination rate and evidence support coverage.
+
+        Step-level scoring is used because the current result schema does not
+        retain independent claim-level verdicts. Uncertain steps remain in the
+        denominator but are never counted as hallucinated. Confidence is the
+        fraction of all steps affirmatively supported, not a ranking-logit
+        sigmoid or a calibrated probability.
+        """
+        total_steps = len(steps)
+        if not total_steps:
+            return 0.0, 0.0, 0, 0
+
+        hallucinated_count = sum(
+            step.status == StepStatus.HALLUCINATED for step in steps
+        )
+        supported_count = sum(
+            step.status == StepStatus.SUPPORTED for step in steps
+        )
+        hallucination_score = hallucinated_count / total_steps
+        confidence_score = supported_count / total_steps
+        return (
+            round(hallucination_score, 3),
+            round(confidence_score, 3),
+            hallucinated_count,
+            supported_count,
+        )
+
     # ------------------------------------------------------------------
     # Pipeline execution
     # ------------------------------------------------------------------
@@ -998,26 +1031,12 @@ class HeraPipeline:
                 if self._check_cancelled(result_id):
                     return result
 
-                hallucinated = sum(
-                    1
-                    for step in verified_steps
-                    if not step.supported
-                )
-
-                supported_count = len(verified_steps) - hallucinated
-
-                result.hallucination_score = round(
-                    hallucinated / max(len(verified_steps), 1),
-                    3,
-                )
-
-                result.confidence_score = round(
-                    sum(
-                        step.confidence
-                        for step in verified_steps
-                    ) / max(len(verified_steps), 1),
-                    3,
-                )
+                (
+                    result.hallucination_score,
+                    result.confidence_score,
+                    hallucinated,
+                    supported_count,
+                ) = self._verification_metrics(verified_steps)
 
                 self._save_result(result)
 

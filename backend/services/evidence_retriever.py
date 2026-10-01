@@ -113,7 +113,8 @@ class EvidenceRetriever:
             scores = encoder.predict(pairs)
         except Exception as e:
             logger.warning("Cross-encoder scoring failed: %s", e)
-            scores = np.random.uniform(0.3, 0.7, len(pairs))
+            # Deterministic neutral scores when ranking is unavailable.
+            scores = [0.0] * len(pairs)
 
         ranked = sorted(
             zip(region_captions, scores),

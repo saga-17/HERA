@@ -102,14 +102,14 @@ function getVerificationStatus(result: HeraResult): "SUPPORTED" | "UNSUPPORTED" 
     return "INCONCLUSIVE";
   }
 
-  const supported = result.steps.filter((step) => step.supported).length;
-  const unsupported = result.steps.filter((step) => !step.supported).length;
+  const supported = result.steps.filter((step) => step.status === "supported").length;
+  const hallucinated = result.steps.filter((step) => step.status === "hallucinated").length;
 
-  if (unsupported === 0 && supported > 0) {
+  if (hallucinated === 0 && supported === result.steps.length) {
     return "SUPPORTED";
   }
 
-  if (supported === 0 && unsupported > 0) {
+  if (supported === 0 && hallucinated === result.steps.length) {
     return "UNSUPPORTED";
   }
 
@@ -607,7 +607,7 @@ export default function ResultPage() {
         <div className="card text-center">
           <div className="text-xs text-slate-400 mb-1">Hallucinated Steps</div>
           <div className="text-3xl font-bold text-red-400">
-            {result.steps.filter((s) => !s.supported).length}
+            {result.steps.filter((s) => s.status === "hallucinated").length}
           </div>
         </div>
       </div>

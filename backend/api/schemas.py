@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class HallucinationType(str, Enum):
@@ -70,6 +70,11 @@ class ReasoningStepResult(BaseModel):
     textual_evidence: list[TextEvidence] = Field(default_factory=list)
     attribution: str = ""
     extraction: EntityExtraction = Field(default_factory=EntityExtraction)
+
+    @model_validator(mode="after")
+    def align_supported_flag_with_status(self) -> "ReasoningStepResult":
+        self.supported = self.status == StepStatus.SUPPORTED
+        return self
 
 
 class PipelineStageInfo(BaseModel):

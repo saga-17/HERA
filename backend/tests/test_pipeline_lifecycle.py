@@ -26,6 +26,80 @@ class TestPipelineLifecycle(unittest.TestCase):
     def setUp(self):
         self.pipeline = HeraPipeline()
 
+    def _metric_step(self, status, step_index=0):
+        return ReasoningStepResult(
+            step_index=step_index,
+            step="A claim.",
+            status=status,
+            confidence=0.73,
+            supported=(status == StepStatus.SUPPORTED),
+            extraction=EntityExtraction(),
+        )
+
+    def test_verification_metrics_cover_supported_and_uncertain_statuses(self):
+        cases = (
+            ([StepStatus.SUPPORTED, StepStatus.SUPPORTED], (0.0, 1.0, 0, 2)),
+            ([StepStatus.SUPPORTED, StepStatus.UNCERTAIN], (0.0, 0.5, 0, 1)),
+            ([StepStatus.SUPPORTED, StepStatus.HALLUCINATED], (0.5, 0.5, 1, 1)),
+            ([StepStatus.UNCERTAIN, StepStatus.UNCERTAIN], (0.0, 0.0, 0, 0)),
+            ([StepStatus.HALLUCINATED, StepStatus.HALLUCINATED], (1.0, 0.0, 2, 0)),
+        )
+        for statuses, expected in cases:
+            with self.subTest(statuses=statuses):
+                steps = [self._metric_step(status, i) for i, status in enumerate(statuses)]
+                result = self.pipeline._verification_metrics(steps)
+                self.assertEqual(result, expected)
+                self.assertEqual(result, self.pipeline._verification_metrics(steps))
+
+    def test_status_controls_supported_boolean(self):
+        for status, expected in (
+            (StepStatus.SUPPORTED, True),
+            (StepStatus.HALLUCINATED, False),
+            (StepStatus.UNCERTAIN, False),
+        ):
+            with self.subTest(status=status):
+                step = ReasoningStepResult(
+                    step_index=0,
+                    step="A claim.",
+                    status=status,
+                    confidence=0.5,
+                    supported=not expected,
+                )
+                self.assertEqual(step.supported, expected)
+
+    def test_uncertain_irrelevant_step_preserves_supported_final_answer(self):
+        supported = self._metric_step(StepStatus.SUPPORTED)
+        supported.step = "The image shows a dog."
+        uncertain = self._metric_step(StepStatus.UNCERTAIN, 1)
+        uncertain.step = "A distant sign contains unreadable text."
+
+        _corrected, answer = ReasoningCorrector().correct(
+            "", [supported, uncertain], "What animal is shown?"
+        )
+        self.assertIn("dog", answer.lower())
+        self.assertNotIn("sign", answer.lower())
+
+    def test_retrieval_ranker_failure_is_deterministic(self):
+        retriever = EvidenceRetriever()
+        image = Image.new("RGB", (30, 30), color="white")
+        with (
+            patch("backend.services.evidence_retriever.settings.demo_mode", False),
+            patch(
+                "backend.services.evidence_retriever.model_manager.get_cross_encoder",
+                side_effect=RuntimeError("ranker unavailable"),
+            ),
+        ):
+            first = retriever._retrieve_visual_evidence(
+                "A tree is visible.", image, 0, "A tree is visible."
+            )
+            second = retriever._retrieve_visual_evidence(
+                "A tree is visible.", image, 0, "A tree is visible."
+            )
+        self.assertEqual(
+            [(e.bbox, e.confidence, e.caption) for e in first],
+            [(e.bbox, e.confidence, e.caption) for e in second],
+        )
+
     def test_cancel_marks_result_as_cancelled(self):
         result = HeraResult(
             result_id="run-123",
